@@ -1,15 +1,17 @@
 package vault
 
 import (
+	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"time"
-
-	ini "gopkg.in/ini.v1"
 )
 
 const (
@@ -25,14 +27,17 @@ const (
 	defaultSectionName = "default"
 )
 
-func init() {
-	ini.PrettyFormat = false
-}
-
 // ConfigFile is an abstraction over what is in ~/.aws/config
 type ConfigFile struct {
-	Path    string
-	iniFile *ini.File
+	Path string
+	// rawBytes holds the original file content, preserved for Save().
+	rawBytes []byte
+	// sections maps section key (e.g. "profile foo", "default") to
+	// lowercased-key → value, for fast O(1) lookups.
+	sections map[string]map[string]string
+	// sectionOrder preserves the order sections appear in the file,
+	// needed for ProfileSections() to return profiles in declaration order.
+	sectionOrder []string
 }
 
 // configPath returns either $AWS_CONFIG_FILE or ~/.aws/config
@@ -112,19 +117,65 @@ func LoadConfigFromEnv() (*ConfigFile, error) {
 func (c *ConfigFile) parseFile() error {
 	log.Printf("Parsing config file %s", c.Path)
 
-	f, err := ini.LoadSources(ini.LoadOptions{
-		AllowNestedValues:   true,
-		InsensitiveSections: false,
-		InsensitiveKeys:     true,
-		// Require a space before '#' to treat it as an inline comment.
-		// Without this, '#' in values like sso_start_url is stripped.
-		SpaceBeforeInlineComment: true,
-	}, c.Path)
+	data, err := os.ReadFile(c.Path)
 	if err != nil {
 		return fmt.Errorf("Error parsing config file %s: %w", c.Path, err)
 	}
-	c.iniFile = f
-	return nil
+	c.rawBytes = data
+	// Pre-size for large Datadog-style configs (~175k sections).
+	c.sections = make(map[string]map[string]string, 200000)
+	c.sectionOrder = nil
+
+	var currentKey string
+	var currentMap map[string]string
+
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Indented lines are nested ini values; skip them for profile parsing
+		// but they are preserved in rawBytes for round-trip Save().
+		if len(line) > 0 && (line[0] == ' ' || line[0] == '\t') {
+			continue
+		}
+
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || trimmed[0] == '#' || trimmed[0] == ';' {
+			continue
+		}
+
+		if trimmed[0] == '[' && trimmed[len(trimmed)-1] == ']' {
+			sectionName := trimmed[1 : len(trimmed)-1]
+			currentKey = sectionName
+			if existing, ok := c.sections[sectionName]; ok {
+				currentMap = existing
+			} else {
+				currentMap = make(map[string]string, 8)
+				c.sections[sectionName] = currentMap
+				c.sectionOrder = append(c.sectionOrder, sectionName)
+			}
+			continue
+		}
+
+		if currentKey == "" {
+			continue
+		}
+
+		k, v, ok := strings.Cut(trimmed, "=")
+		if !ok {
+			continue
+		}
+		k = strings.ToLower(strings.TrimSpace(k))
+		v = strings.TrimSpace(v)
+
+		// Strip inline comment: space followed by # (matches AWS CLI behaviour).
+		if idx := strings.Index(v, " #"); idx >= 0 {
+			v = strings.TrimSpace(v[:idx])
+		}
+
+		currentMap[k] = v
+	}
+	return scanner.Err()
 }
 
 // ProfileSection is a profile section of the config file
@@ -171,10 +222,10 @@ func (s ProfileSection) IsEmpty() bool {
 func (c *ConfigFile) ProfileSections() []ProfileSection {
 	result := []ProfileSection{}
 
-	if c.iniFile == nil {
+	if c.sections == nil {
 		return result
 	}
-	for _, section := range c.iniFile.SectionStrings() {
+	for _, section := range c.sectionOrder {
 		if section == defaultSectionName || strings.HasPrefix(section, "profile ") {
 			profile, _ := c.ProfileSection(strings.TrimPrefix(section, "profile "))
 
@@ -185,7 +236,6 @@ func (c *ConfigFile) ProfileSections() []ProfileSection {
 
 			result = append(result, profile)
 		} else if strings.HasPrefix(section, "sso-session ") {
-			// Not a profile
 			continue
 		} else {
 			log.Printf("Unrecognised ini file section: %s", section)
@@ -196,72 +246,150 @@ func (c *ConfigFile) ProfileSections() []ProfileSection {
 	return result
 }
 
+// mapToProfileSection maps a key-value store to a ProfileSection without reflection.
+func mapToProfileSection(kv map[string]string, p *ProfileSection) {
+	p.MfaSerial = kv["mfa_serial"]
+	p.RoleARN = kv["role_arn"]
+	p.ExternalID = kv["external_id"]
+	p.Region = kv["region"]
+	p.RoleSessionName = kv["role_session_name"]
+	if v := kv["duration_seconds"]; v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			p.DurationSeconds = uint(n)
+		}
+	}
+	p.SourceProfile = kv["source_profile"]
+	p.IncludeProfile = kv["include_profile"]
+	p.SSOSession = kv["sso_session"]
+	p.SSOStartURL = kv["sso_start_url"]
+	p.SSORegion = kv["sso_region"]
+	p.SSOAccountID = kv["sso_account_id"]
+	p.SSORoleName = kv["sso_role_name"]
+	p.WebIdentityTokenFile = kv["web_identity_token_file"]
+	p.WebIdentityTokenProcess = kv["web_identity_token_process"]
+	p.STSRegionalEndpoints = kv["sts_regional_endpoints"]
+	p.EndpointURL = kv["endpoint_url"]
+	p.SessionTags = kv["session_tags"]
+	p.TransitiveSessionTags = kv["transitive_session_tags"]
+	p.SourceIdentity = kv["source_identity"]
+	p.CredentialProcess = kv["credential_process"]
+	p.MfaProcess = kv["mfa_process"]
+}
+
 // ProfileSection returns the profile section with the matching name. If there isn't any,
 // an empty profile with the provided name is returned, along with false.
 func (c *ConfigFile) ProfileSection(name string) (ProfileSection, bool) {
-	profile := ProfileSection{
-		Name: name,
-	}
-	if c.iniFile == nil {
+	profile := ProfileSection{Name: name}
+	if c.sections == nil {
 		return profile, false
 	}
-	// default profile name has a slightly different section format
 	sectionName := "profile " + name
 	if name == defaultSectionName {
 		sectionName = defaultSectionName
 	}
-	section, err := c.iniFile.GetSection(sectionName)
-	if err != nil {
+	kv, ok := c.sections[sectionName]
+	if !ok {
 		return profile, false
 	}
-	if err = section.MapTo(&profile); err != nil {
-		panic(err)
-	}
+	mapToProfileSection(kv, &profile)
 	return profile, true
 }
 
 // SSOSessionSection returns the [sso-session] section with the matching name. If there isn't any,
 // an empty sso-session with the provided name is returned, along with false.
 func (c *ConfigFile) SSOSessionSection(name string) (SSOSessionSection, bool) {
-	ssoSession := SSOSessionSection{
-		Name: name,
-	}
-	if c.iniFile == nil {
+	ssoSession := SSOSessionSection{Name: name}
+	if c.sections == nil {
 		return ssoSession, false
 	}
 	sectionName := "sso-session " + name
-	section, err := c.iniFile.GetSection(sectionName)
-	if err != nil {
+	kv, ok := c.sections[sectionName]
+	if !ok {
 		return ssoSession, false
 	}
-	if err = section.MapTo(&ssoSession); err != nil {
-		panic(err)
-	}
+	ssoSession.SSOStartURL = kv["sso_start_url"]
+	ssoSession.SSORegion = kv["sso_region"]
+	ssoSession.SSORegistrationScopes = kv["sso_registration_scopes"]
 	return ssoSession, true
 }
 
 func (c *ConfigFile) Save() error {
-	return c.iniFile.SaveTo(c.Path)
+	dir := filepath.Dir(c.Path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("unable to create config directory: %w", err)
+	}
+	return os.WriteFile(c.Path, c.rawBytes, 0600)
 }
 
 // Add the profile to the configuration file
 func (c *ConfigFile) Add(profile ProfileSection) error {
-	if c.iniFile == nil {
-		return errors.New("No iniFile to add to")
+	if c.sections == nil {
+		return errors.New("No config loaded to add to")
 	}
-	// default profile name has a slightly different section format
 	sectionName := "profile " + profile.Name
 	if profile.Name == defaultSectionName {
 		sectionName = defaultSectionName
 	}
-	section, err := c.iniFile.NewSection(sectionName)
-	if err != nil {
-		return fmt.Errorf("Error creating section %q: %v", profile.Name, err)
+
+	// Serialize the new section using struct field order from ini tags.
+	var buf bytes.Buffer
+	buf.WriteString("\n[" + sectionName + "]\n")
+
+	t := reflect.TypeOf(profile)
+	v := reflect.ValueOf(profile)
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		tag := field.Tag.Get("ini")
+		if tag == "" || tag == "-" {
+			continue
+		}
+		parts := strings.SplitN(tag, ",", 2)
+		key := parts[0]
+		omitempty := len(parts) == 2 && parts[1] == "omitempty"
+
+		fv := v.Field(i)
+		var strVal string
+		switch fv.Kind() {
+		case reflect.String:
+			strVal = fv.String()
+		case reflect.Uint:
+			if fv.Uint() == 0 {
+				continue
+			}
+			strVal = strconv.FormatUint(fv.Uint(), 10)
+		default:
+			continue
+		}
+		if omitempty && strVal == "" {
+			continue
+		}
+		buf.WriteString(key + "=" + strVal + "\n")
 	}
-	if err = section.ReflectFrom(&profile); err != nil {
-		return fmt.Errorf("Error mapping profile to ini file: %v", err)
+
+	newSection := buf.Bytes()
+	c.rawBytes = append(c.rawBytes, newSection...)
+
+	// Update in-memory state so ProfileSections() reflects the addition.
+	kv := make(map[string]string, 8)
+	c.sections[sectionName] = kv
+	c.sectionOrder = append(c.sectionOrder, sectionName)
+
+	// Re-parse the new section's kv from the serialized bytes so the map
+	// is consistent with what was written.
+	scanner := bufio.NewScanner(bytes.NewReader(newSection))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if len(line) == 0 || line[0] == '[' || line[0] == '#' {
+			continue
+		}
+		k, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		kv[strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(val)
 	}
-	return c.Save()
+
+	return os.WriteFile(c.Path, c.rawBytes, 0600)
 }
 
 // ProfileNames returns a slice of profile names from the AWS config

@@ -70,7 +70,7 @@ region=us-west-2
 output=json
 `)
 
-func newConfigFile(t *testing.T, b []byte) string {
+func newConfigFile(t testing.TB, b []byte) string {
 	t.Helper()
 	f, err := os.CreateTemp("", "aws-config")
 	if err != nil {
@@ -621,5 +621,126 @@ source_profile = interim
 
 	if len(baseConfig.TransitiveSessionTags) > 0 {
 		t.Fatalf("Expected transitive_session_tags to be empty, got %+v", baseConfig.TransitiveSessionTags)
+	}
+}
+
+func BenchmarkParseRealConfig(b *testing.B) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		b.Skip("no home dir:", err)
+	}
+	path := home + "/.aws/config"
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		b.Skip("no config file at", path)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		cfg, err := vault.LoadConfig(path)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = cfg
+	}
+}
+
+func BenchmarkParseSmallConfig(b *testing.B) {
+	f := newConfigFile(b, exampleConfig)
+	defer os.Remove(f)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		cfg, err := vault.LoadConfig(f)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = cfg
+	}
+}
+
+// generateLargeConfig writes a synthetic config with n profiles (2 keys each)
+// to a temp file and returns its path. Mirrors the ddtool-generated shape.
+func generateLargeConfig(b *testing.B, n int) string {
+	b.Helper()
+	f, err := os.CreateTemp("", "aws-config-large")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer f.Close()
+
+	fmt.Fprintf(f, "[default]\nregion=us-east-1\n\n")
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(f, "[profile sso-acct%d-role%d]\nsso_account_id=%012d\nsso_role_name=role%d\nsso_start_url=https://d-abc123.awsapps.com/start\nsso_region=us-east-1\nregion=us-east-1\n\n", i, i, i, i)
+		fmt.Fprintf(f, "[profile exec-sso-acct%d-role%d]\ncredential_process=aws-vault export --format=json sso-acct%d-role%d\n\n", i, i, i, i)
+	}
+	return f.Name()
+}
+
+func BenchmarkParseLargeSyntheticConfig(b *testing.B) {
+	path := generateLargeConfig(b, 87000) // ~174k sections like the real file
+	defer os.Remove(path)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cfg, err := vault.LoadConfig(path)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = cfg
+	}
+}
+
+func BenchmarkProfileSectionLookup(b *testing.B) {
+	f := newConfigFile(b, exampleConfig)
+	defer os.Remove(f)
+	cfg, err := vault.LoadConfig(f)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		p, _ := cfg.ProfileSection("withMFA")
+		_ = p
+	}
+}
+
+func BenchmarkProfileSectionLookupRealConfig(b *testing.B) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		b.Skip("no home dir:", err)
+	}
+	path := home + "/.aws/config"
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		b.Skip("no config file at", path)
+	}
+	cfg, err := vault.LoadConfig(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		p, _ := cfg.ProfileSection("sso-account-account-admin")
+		_ = p
+	}
+}
+
+func BenchmarkProfileSections(b *testing.B) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		b.Skip("no home dir:", err)
+	}
+	path := home + "/.aws/config"
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		b.Skip("no config file at", path)
+	}
+	cfg, err := vault.LoadConfig(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sections := cfg.ProfileSections()
+		_ = sections
 	}
 }
