@@ -1,15 +1,18 @@
 package vault
 
 import (
+	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
-
-	ini "gopkg.in/ini.v1"
 )
 
 const (
@@ -25,14 +28,15 @@ const (
 	defaultSectionName = "default"
 )
 
-func init() {
-	ini.PrettyFormat = false
-}
-
 // ConfigFile is an abstraction over what is in ~/.aws/config
 type ConfigFile struct {
-	Path    string
-	iniFile *ini.File
+	Path string
+	// rawBytes holds the original file content, preserved for Save().
+	rawBytes []byte
+	// sections maps section name to lowercased-key → value for O(1) lookups.
+	sections map[string]map[string]string
+	// sectionOrder preserves the order sections appear in the file.
+	sectionOrder []string
 }
 
 // configPath returns either $AWS_CONFIG_FILE or ~/.aws/config
@@ -112,19 +116,128 @@ func LoadConfigFromEnv() (*ConfigFile, error) {
 func (c *ConfigFile) parseFile() error {
 	log.Printf("Parsing config file %s", c.Path)
 
-	f, err := ini.LoadSources(ini.LoadOptions{
-		AllowNestedValues:   true,
-		InsensitiveSections: false,
-		InsensitiveKeys:     true,
-		// Require a space before '#' to treat it as an inline comment.
-		// Without this, '#' in values like sso_start_url is stripped.
-		SpaceBeforeInlineComment: true,
-	}, c.Path)
+	data, err := os.ReadFile(c.Path)
 	if err != nil {
 		return fmt.Errorf("Error parsing config file %s: %w", c.Path, err)
 	}
-	c.iniFile = f
-	return nil
+	c.rawBytes = data
+	// Pre-size to reduce rehashing; ~150 bytes per section on average.
+	c.sections = make(map[string]map[string]string, len(data)/150+4)
+	c.sectionOrder = nil
+
+	var current map[string]string
+
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	// Raise the per-line limit to 1 MiB. The default 64 KiB can be exceeded
+	// by long credential_process or web_identity_token_process values.
+	// Use a small initial buffer (4 KiB, same as the scanner default) so that
+	// small files don't pay for the large max-size allocation.
+	scanner.Buffer(make([]byte, 0, 4096), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Indented lines are sub-properties (e.g. per-service endpoint config).
+		// Skip them for profile parsing; they are preserved in rawBytes for Save().
+		if len(line) > 0 && (line[0] == ' ' || line[0] == '\t') {
+			continue
+		}
+
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || trimmed[0] == '#' || trimmed[0] == ';' {
+			continue
+		}
+
+		if trimmed[0] == '[' {
+			current = c.openSection(trimmed)
+			continue
+		}
+
+		if current == nil {
+			continue
+		}
+
+		if k, v, ok := splitKeyValue(trimmed); ok {
+			current[k] = v
+		}
+	}
+	return scanner.Err()
+}
+
+// openSection parses a section header line (e.g. "[profile foo] # comment"),
+// registers the section if it has not been seen before, and returns its
+// key-value map so that subsequent key writes land in the right place.
+//
+// Section names are taken verbatim between '[' and the last ']'; inner
+// whitespace is preserved to match ini.v1 behaviour. Text after the closing
+// ']' is ignored, allowing inline comments on section headers.
+func (c *ConfigFile) openSection(line string) map[string]string {
+	closeIdx := strings.LastIndex(line, "]")
+	if closeIdx < 0 {
+		return nil
+	}
+	name := line[1:closeIdx]
+	if m, ok := c.sections[name]; ok {
+		return m // duplicate section — reuse map so keys are merged
+	}
+	m := make(map[string]string, 8)
+	c.sections[name] = m
+	c.sectionOrder = append(c.sectionOrder, name)
+	return m
+}
+
+// splitKeyValue parses a "key=value" or "key: value" line into a lowercased,
+// trimmed key and a processed value. The first '=' or ':' is used as the
+// delimiter, matching ini.v1's KeyValueDelimiters="=:" default. Returns
+// ok=false when no delimiter is found.
+func splitKeyValue(line string) (key, val string, ok bool) {
+	sepIdx := strings.IndexAny(line, "=:")
+	if sepIdx < 0 {
+		return "", "", false
+	}
+	key = strings.ToLower(strings.TrimSpace(line[:sepIdx]))
+	if key == "" {
+		return "", "", false
+	}
+	val = stripInlineComment(strings.TrimSpace(line[sepIdx+1:]))
+	val = stripSurroundingQuotes(val)
+	return key, val, true
+}
+
+// stripInlineComment removes a trailing comment from a value. Only a literal
+// space immediately before '#' or ';' triggers stripping — a tab does not —
+// matching ini.v1's SpaceBeforeInlineComment behaviour. When both comment
+// markers appear, the leftmost one wins.
+//
+// When the value begins with a single or double quote, comment markers inside
+// the quoted region are skipped; only markers after the closing quote count.
+func stripInlineComment(v string) string {
+	searchFrom := 0
+	if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') {
+		if closing := strings.IndexByte(v[1:], v[0]); closing >= 0 {
+			searchFrom = closing + 2 // skip past the closing quote
+		}
+	}
+	cutAt := -1
+	for _, marker := range []string{" #", " ;"} {
+		if i := strings.Index(v[searchFrom:], marker); i >= 0 {
+			if pos := searchFrom + i; cutAt < 0 || pos < cutAt {
+				cutAt = pos
+			}
+		}
+	}
+	if cutAt < 0 {
+		return v
+	}
+	return strings.TrimRight(v[:cutAt], " \t")
+}
+
+// stripSurroundingQuotes removes a matching outer '"' or '\'' pair, matching
+// ini.v1's PreserveSurroundedQuote=false default.
+func stripSurroundingQuotes(v string) string {
+	if len(v) >= 2 && ((v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'')) {
+		return v[1 : len(v)-1]
+	}
+	return v
 }
 
 // ProfileSection is a profile section of the config file
@@ -171,10 +284,10 @@ func (s ProfileSection) IsEmpty() bool {
 func (c *ConfigFile) ProfileSections() []ProfileSection {
 	result := []ProfileSection{}
 
-	if c.iniFile == nil {
+	if c.sections == nil {
 		return result
 	}
-	for _, section := range c.iniFile.SectionStrings() {
+	for _, section := range c.sectionOrder {
 		if section == defaultSectionName || strings.HasPrefix(section, "profile ") {
 			profile, _ := c.ProfileSection(strings.TrimPrefix(section, "profile "))
 
@@ -184,7 +297,7 @@ func (c *ConfigFile) ProfileSections() []ProfileSection {
 			}
 
 			result = append(result, profile)
-		} else if strings.HasPrefix(section, "sso-session ") {
+		} else if strings.HasPrefix(section, "sso-session ") || strings.HasPrefix(section, "services ") {
 			// Not a profile
 			continue
 		} else {
@@ -196,71 +309,186 @@ func (c *ConfigFile) ProfileSections() []ProfileSection {
 	return result
 }
 
+// mapToProfileSection populates a ProfileSection from a parsed key-value map.
+func mapToProfileSection(kv map[string]string, p *ProfileSection) {
+	p.MfaSerial = kv["mfa_serial"]
+	p.RoleARN = kv["role_arn"]
+	p.ExternalID = kv["external_id"]
+	p.Region = kv["region"]
+	p.RoleSessionName = kv["role_session_name"]
+	if v := kv["duration_seconds"]; v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			p.DurationSeconds = uint(n)
+		}
+	}
+	p.SourceProfile = kv["source_profile"]
+	p.IncludeProfile = kv["include_profile"]
+	p.SSOSession = kv["sso_session"]
+	p.SSOStartURL = kv["sso_start_url"]
+	p.SSORegion = kv["sso_region"]
+	p.SSOAccountID = kv["sso_account_id"]
+	p.SSORoleName = kv["sso_role_name"]
+	p.WebIdentityTokenFile = kv["web_identity_token_file"]
+	p.WebIdentityTokenProcess = kv["web_identity_token_process"]
+	p.STSRegionalEndpoints = kv["sts_regional_endpoints"]
+	p.EndpointURL = kv["endpoint_url"]
+	p.SessionTags = kv["session_tags"]
+	p.TransitiveSessionTags = kv["transitive_session_tags"]
+	p.SourceIdentity = kv["source_identity"]
+	p.CredentialProcess = kv["credential_process"]
+	p.MfaProcess = kv["mfa_process"]
+}
+
 // ProfileSection returns the profile section with the matching name. If there isn't any,
 // an empty profile with the provided name is returned, along with false.
 func (c *ConfigFile) ProfileSection(name string) (ProfileSection, bool) {
-	profile := ProfileSection{
-		Name: name,
-	}
-	if c.iniFile == nil {
+	profile := ProfileSection{Name: name}
+	if c.sections == nil {
 		return profile, false
 	}
-	// default profile name has a slightly different section format
 	sectionName := "profile " + name
 	if name == defaultSectionName {
 		sectionName = defaultSectionName
 	}
-	section, err := c.iniFile.GetSection(sectionName)
-	if err != nil {
+	kv, ok := c.sections[sectionName]
+	if !ok {
 		return profile, false
 	}
-	if err = section.MapTo(&profile); err != nil {
-		panic(err)
-	}
+	mapToProfileSection(kv, &profile)
 	return profile, true
 }
 
 // SSOSessionSection returns the [sso-session] section with the matching name. If there isn't any,
 // an empty sso-session with the provided name is returned, along with false.
 func (c *ConfigFile) SSOSessionSection(name string) (SSOSessionSection, bool) {
-	ssoSession := SSOSessionSection{
-		Name: name,
-	}
-	if c.iniFile == nil {
+	ssoSession := SSOSessionSection{Name: name}
+	if c.sections == nil {
 		return ssoSession, false
 	}
-	sectionName := "sso-session " + name
-	section, err := c.iniFile.GetSection(sectionName)
-	if err != nil {
+	kv, ok := c.sections["sso-session "+name]
+	if !ok {
 		return ssoSession, false
 	}
-	if err = section.MapTo(&ssoSession); err != nil {
-		panic(err)
-	}
+	ssoSession.SSOStartURL = kv["sso_start_url"]
+	ssoSession.SSORegion = kv["sso_region"]
+	ssoSession.SSORegistrationScopes = kv["sso_registration_scopes"]
 	return ssoSession, true
 }
 
 func (c *ConfigFile) Save() error {
-	return c.iniFile.SaveTo(c.Path)
+	return os.WriteFile(c.Path, c.rawBytes, 0600)
 }
 
-// Add the profile to the configuration file
-func (c *ConfigFile) Add(profile ProfileSection) error {
-	if c.iniFile == nil {
-		return errors.New("No iniFile to add to")
+// removeSection excises the named section from raw config bytes and returns
+// the result. It removes the section header line and all subsequent lines
+// (including indented sub-properties and blank lines within the block) up to
+// but not including the next section header. If the section is not found,
+// data is returned unchanged.
+func removeSection(data []byte, name string) []byte {
+	var out bytes.Buffer
+	out.Grow(len(data))
+	skip := false
+
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
+
+		if skip {
+			// End the skip region only when a new section header is found.
+			if trimmed != "" && trimmed[0] == '[' {
+				skip = false
+				// fall through to emit this header
+			} else {
+				continue
+			}
+		}
+
+		if trimmed != "" && trimmed[0] == '[' {
+			closeIdx := strings.LastIndex(trimmed, "]")
+			if closeIdx > 0 && trimmed[1:closeIdx] == name {
+				skip = true
+				continue
+			}
+		}
+
+		out.WriteString(line)
+		out.WriteByte('\n')
 	}
-	// default profile name has a slightly different section format
+	return out.Bytes()
+}
+
+// mapFromProfileSection builds a key-value map from a ProfileSection using ini struct tags.
+func mapFromProfileSection(p ProfileSection) map[string]string {
+	kv := make(map[string]string, 8)
+	t := reflect.TypeOf(p)
+	v := reflect.ValueOf(p)
+	for i := 0; i < t.NumField(); i++ {
+		tag := t.Field(i).Tag.Get("ini")
+		if tag == "" || tag == "-" {
+			continue
+		}
+		key := strings.SplitN(tag, ",", 2)[0]
+		fv := v.Field(i)
+		switch fv.Kind() {
+		case reflect.String:
+			if s := fv.String(); s != "" {
+				kv[key] = s
+			}
+		case reflect.Uint:
+			if n := fv.Uint(); n > 0 {
+				kv[key] = strconv.FormatUint(n, 10)
+			}
+		}
+	}
+	return kv
+}
+
+// Add the profile to the configuration file. If a section with that name
+// already exists, it is replaced (its old block is removed from rawBytes and
+// the new content is appended), preventing unbounded file growth.
+func (c *ConfigFile) Add(profile ProfileSection) error {
 	sectionName := "profile " + profile.Name
 	if profile.Name == defaultSectionName {
 		sectionName = defaultSectionName
 	}
-	section, err := c.iniFile.NewSection(sectionName)
-	if err != nil {
-		return fmt.Errorf("Error creating section %q: %v", profile.Name, err)
+
+	// Remove the existing block so we don't accumulate duplicates on update.
+	if c.sections != nil {
+		if _, exists := c.sections[sectionName]; exists {
+			c.rawBytes = removeSection(c.rawBytes, sectionName)
+		}
 	}
-	if err = section.ReflectFrom(&profile); err != nil {
-		return fmt.Errorf("Error mapping profile to ini file: %v", err)
+
+	kv := mapFromProfileSection(profile)
+	keys := make([]string, 0, len(kv))
+	for k := range kv {
+		keys = append(keys, k)
 	}
+	sort.Strings(keys)
+
+	var buf strings.Builder
+	buf.WriteString("\n[")
+	buf.WriteString(sectionName)
+	buf.WriteString("]\n")
+	for _, k := range keys {
+		buf.WriteString(k)
+		buf.WriteByte('=')
+		buf.WriteString(kv[k])
+		buf.WriteByte('\n')
+	}
+
+	c.rawBytes = append(c.rawBytes, []byte(buf.String())...)
+
+	if c.sections == nil {
+		c.sections = make(map[string]map[string]string)
+	}
+	if _, exists := c.sections[sectionName]; !exists {
+		c.sectionOrder = append(c.sectionOrder, sectionName)
+	}
+	c.sections[sectionName] = kv
+
 	return c.Save()
 }
 

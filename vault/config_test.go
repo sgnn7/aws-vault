@@ -1396,3 +1396,177 @@ func BenchmarkProfileSections(b *testing.B) {
 		_ = sections
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests for bugs fixed after the initial parser replacement
+// ---------------------------------------------------------------------------
+
+// TestAddUpdatesExistingProfile verifies that calling Add() for a profile that
+// already exists replaces it rather than appending a duplicate section block.
+func TestAddUpdatesExistingProfile(t *testing.T) {
+	cfg := []byte("[default]\nregion=us-west-2\n\n[profile user2]\nregion=us-east-1\n")
+	f := newConfigFile(t, cfg)
+	defer os.Remove(f)
+
+	c, err := vault.LoadConfig(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = c.Add(vault.ProfileSection{
+		Name:      "user2",
+		Region:    "eu-west-1",
+		MfaSerial: "arn:aws:iam::123:mfa/user",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// In-memory lookup must reflect updated values immediately.
+	p, ok := c.ProfileSection("user2")
+	if !ok {
+		t.Fatal("profile user2 not found in memory after Add()")
+	}
+	if p.Region != "eu-west-1" {
+		t.Errorf("Region: want eu-west-1, got %q", p.Region)
+	}
+	if p.MfaSerial != "arn:aws:iam::123:mfa/user" {
+		t.Errorf("MfaSerial: want arn:aws:iam::123:mfa/user, got %q", p.MfaSerial)
+	}
+
+	// Saved file must have exactly one [profile user2] header.
+	b, err := os.ReadFile(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count := bytes.Count(b, []byte("[profile user2]")); count != 1 {
+		t.Errorf("file has %d [profile user2] headers, want 1\n%s", count, b)
+	}
+
+	// After re-loading from disk the values must still be correct.
+	c2, err := vault.LoadConfig(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, ok2 := c2.ProfileSection("user2")
+	if !ok2 {
+		t.Fatal("profile user2 not found after re-load")
+	}
+	if p2.Region != "eu-west-1" {
+		t.Errorf("after reload — Region: want eu-west-1, got %q", p2.Region)
+	}
+}
+
+// TestParserCRLFLineEndings verifies that Windows-style \r\n line endings are
+// handled correctly; the \r must not bleed into section names or values.
+func TestParserCRLFLineEndings(t *testing.T) {
+	cfg := "[default]\r\nregion=us-east-1\r\n\r\n[profile p]\r\nrole_arn=arn:aws:iam::123:role/R\r\n"
+	f := newConfigFile(t, []byte(cfg))
+	defer os.Remove(f)
+
+	c, err := vault.LoadConfig(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	def, ok := c.ProfileSection("default")
+	if !ok {
+		t.Fatal("default profile not found")
+	}
+	if def.Region != "us-east-1" {
+		t.Errorf("Region: want us-east-1, got %q", def.Region)
+	}
+	p, ok := c.ProfileSection("p")
+	if !ok {
+		t.Fatal("profile p not found")
+	}
+	if p.RoleARN != "arn:aws:iam::123:role/R" {
+		t.Errorf("RoleARN: want arn:aws:iam::123:role/R, got %q", p.RoleARN)
+	}
+}
+
+// TestParserEmptyKeyIgnored verifies that a line with no key before the
+// delimiter (e.g. "= orphaned") does not panic and is silently dropped.
+func TestParserEmptyKeyIgnored(t *testing.T) {
+	cfg := "[profile p]\n= orphaned-value\nregion=us-east-1\n"
+	f := newConfigFile(t, []byte(cfg))
+	defer os.Remove(f)
+
+	c, err := vault.LoadConfig(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _ := c.ProfileSection("p")
+	if p.Region != "us-east-1" {
+		t.Errorf("Region: want us-east-1, got %q", p.Region)
+	}
+}
+
+// TestParserHashInsideQuotedValuePreserved verifies that a '#' character
+// inside a double-quoted value is not treated as an inline comment marker.
+func TestParserHashInsideQuotedValuePreserved(t *testing.T) {
+	cfg := "[profile p]\nregion=\"us-east-1 # not a comment\"\n"
+	f := newConfigFile(t, []byte(cfg))
+	defer os.Remove(f)
+
+	c, err := vault.LoadConfig(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _ := c.ProfileSection("p")
+	if p.Region != "us-east-1 # not a comment" {
+		t.Errorf("Region: want %q, got %q", "us-east-1 # not a comment", p.Region)
+	}
+}
+
+// TestParserHashAfterClosingQuoteIsComment verifies that a '#' that appears
+// after a closing quote is correctly treated as an inline comment.
+func TestParserHashAfterClosingQuoteIsComment(t *testing.T) {
+	cfg := "[profile p]\nregion=\"us-east-1\" # actual comment\n"
+	f := newConfigFile(t, []byte(cfg))
+	defer os.Remove(f)
+
+	c, err := vault.LoadConfig(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _ := c.ProfileSection("p")
+	if p.Region != "us-east-1" {
+		t.Errorf("Region: want us-east-1, got %q", p.Region)
+	}
+}
+
+// TestParserDuplicateSectionKeyPrecedence verifies that when the same section
+// name appears twice, the second occurrence's value wins for any key that both
+// blocks define.
+func TestParserDuplicateSectionKeyPrecedence(t *testing.T) {
+	cfg := "[profile p]\nregion=us-east-1\n\n[profile p]\nregion=eu-west-1\n"
+	f := newConfigFile(t, []byte(cfg))
+	defer os.Remove(f)
+
+	c, err := vault.LoadConfig(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _ := c.ProfileSection("p")
+	if p.Region != "eu-west-1" {
+		t.Errorf("Region: want eu-west-1 (last value wins), got %q", p.Region)
+	}
+}
+
+// TestParserLongLines verifies that lines exceeding the default 64 KiB
+// bufio.Scanner limit are parsed without error.
+func TestParserLongLines(t *testing.T) {
+	longValue := strings.Repeat("x", 100*1024) // 100 KiB — above the 64 KiB default
+	cfg := "[profile p]\ncredential_process=" + longValue + "\n"
+	f := newConfigFile(t, []byte(cfg))
+	defer os.Remove(f)
+
+	c, err := vault.LoadConfig(f)
+	if err != nil {
+		t.Fatalf("LoadConfig failed on long line: %v", err)
+	}
+	p, _ := c.ProfileSection("p")
+	if p.CredentialProcess != longValue {
+		t.Errorf("CredentialProcess length: want %d, got %d", len(longValue), len(p.CredentialProcess))
+	}
+}
